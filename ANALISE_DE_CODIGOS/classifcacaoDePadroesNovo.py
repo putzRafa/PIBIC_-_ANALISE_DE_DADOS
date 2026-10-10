@@ -742,7 +742,7 @@ caminho_do_script = Path(__file__).parent
 #pasta_testes = caminho_do_script.parent
 arquivos_gerais_pibic = caminho_do_script.parent
 
-caminho_exercises = arquivos_gerais_pibic / "DataSet" / "exerciciosSolcao"
+caminho_exercises = arquivos_gerais_pibic / "DataSet" / "exerciciosSolucao"
 
 df_features_final = processar_exercicios_v15(caminho_exercises)
 
