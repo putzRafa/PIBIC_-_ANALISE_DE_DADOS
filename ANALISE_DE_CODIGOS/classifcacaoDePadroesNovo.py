@@ -13,6 +13,32 @@ except ImportError as exc:
     ) from exc
 
 
+# Módulo do documento de padrões (v7) a que cada padrão dominante pertence.
+#   M1 sequencial | M2 condicional simples | M3 condicional composto
+#   M4 encadeado/aninhado | M5 while | M6 estrutura linear (for sobre coleção)
+#   M7 repetição por contagem (for sobre contagem numérica)
+MODULO_POR_PADRAO = {
+    "Input/output sequencial": "M1",
+    "Condicional simples": "M2",
+    "Condicional composto": "M3",
+    "Condicional encadeado": "M4",
+    "Condicional aninhado": "M4",
+    "Repetição - validação de entrada": "M5",
+    "Repetição - controle por menu": "M5",
+    "Repetição - incremento de variável": "M5",
+    "Repetição - acúmulo de variável": "M5",
+    "Repetição com condição - incremento de variável": "M5",
+    "Repetição com condição - acúmulo de variável": "M5",
+    "Estrutura linear (lista/string) - iteração por índice": "M6",
+    "Estrutura linear (lista/string) - iteração por valor": "M6",
+    "Repetição por contagem - incremento de variável": "M7",
+    "Repetição por contagem - acúmulo de variável": "M7",
+}
+
+OPS_ARITMETICAS = (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv)
+OPS_MULTIPLICATIVAS = (ast.Mult, ast.Div, ast.FloorDiv)
+
+
 class ASTMetricsExtractor(ast.NodeVisitor):
     def __init__(self):
         self.metrics = {
@@ -57,9 +83,6 @@ class ASTMetricsExtractor(ast.NodeVisitor):
     def visit_ListComp(self, node):
         self.metrics['num_loops'] += 1
         self.metrics['complexidade_ciclomatica'] += 1
-        # FIX (métricas): antes usava generic_visit puro e não contava a
-        # comprehension na profundidade de aninhamento (max_depth), tratando-a
-        # de forma diferente de for/while/if embora ela também seja um laço.
         self._enter_control_flow(node)
 
     def visit_DictComp(self, node):
@@ -68,14 +91,11 @@ class ASTMetricsExtractor(ast.NodeVisitor):
         self._enter_control_flow(node)
 
     def visit_SetComp(self, node):
-        # FIX (métricas): set comprehensions não eram contabilizadas.
         self.metrics['num_loops'] += 1
         self.metrics['complexidade_ciclomatica'] += 1
         self._enter_control_flow(node)
 
     def visit_GeneratorExp(self, node):
-        # FIX (métricas): geradores (ex.: sum(x for x in lista)) não eram
-        # contabilizados como laço.
         self.metrics['num_loops'] += 1
         self.metrics['complexidade_ciclomatica'] += 1
         self._enter_control_flow(node)
@@ -93,7 +113,12 @@ class ASTMetricsExtractor(ast.NodeVisitor):
 class ASTPlanDetector(ast.NodeVisitor):
     """
     Classifica o código-fonte de acordo com os padrões descritos em
-    "Padrões de Programação" (Módulos 1 a 6).
+    "Padrões de Programação" (Módulos 1 a 7):
+
+        M1 sequencial            M5 repetição por condição (while)
+        M2 condicional simples   M6 estrutura linear (for sobre coleção)
+        M3 condicional composto  M7 repetição por contagem (for sobre range numérico)
+        M4 encadeado/aninhado
     """
 
     def __init__(self, global_metrics, posicoes=None):
@@ -102,49 +127,53 @@ class ASTPlanDetector(ast.NodeVisitor):
 
         # {id(node): (tem_antes, tem_apos)} pré-calculado por
         # _mapa_posicoes_estruturas -- permite cruzar a posição com o TIPO
-        # específico deste mesmo nó (Condicional simples/composto/
-        # encadeado/aninhado), em vez de um agregado global desconectado.
+        # específico deste mesmo nó.
         self.posicoes = posicoes or {}
 
         self.in_if = 0
-        self.in_for = 0
-        self.in_while = 0
+
+        # Pilha de laços ativos. Cada item guarda o tipo do laço ('for' ou
+        # 'while'), a classe do `for` ('indice', 'valor' ou 'contagem') e o
+        # valor de in_if no momento em que o laço foi aberto -- este último
+        # permite saber se um incremento/acúmulo está condicionado por um `if`
+        # DENTRO do laço, e não por um `if` que apenas envolve o laço.
+        self.pilha_lacos = []
+
+        # Raiz (`if` mais externo) da estrutura condicional em visita.
+        self._raiz_if = None
 
     # ------------------------------------------------------------------ #
-    # Condicionais (Módulos 2 e 3)
+    # Condicionais (Módulos 2, 3 e 4)
     # ------------------------------------------------------------------ #
     def visit_If(self, node):
         is_elif = getattr(node, 'is_elif', False)
 
-        # Rótulos atribuídos especificamente a ESTE nó (um If pode receber
-        # mais de um: ex. um if aninhado que também é, em si, um condicional
-        # composto -- "aninhado" descreve a posição; "composto" descreve o
-        # formato das próprias branches. Os dois são fatos simultâneos sobre
-        # o mesmo nó, por isso são coletados numa lista, não um único rótulo).
+        # O `if` mais externo da estrutura é a RAIZ. É ele que define a
+        # posição (antes/depois) do padrão "Condicional aninhado" (M4.2).
+        eh_raiz = (self.in_if == 0)
+        if eh_raiz:
+            self._raiz_if = node
+            node.tem_aninhado = False
+
+        # Rótulos de formato atribuídos a ESTE nó (simples/composto/encadeado).
         tipos_deste_no = []
 
-        # FIX (bug crítico): a versão anterior marcava "Condicional aninhado"
-        # sempre que in_if > 0, sem checar se o `if` atual era, na verdade, a
-        # continuação de uma cadeia elif (que fica estruturalmente dentro do
-        # `orelse` do `if` anterior, e por isso também "parecia" aninhado para
-        # o AST). Isso fazia com que TODO if/elif/.../else fosse contado, de
-        # forma incorreta, também como "Condicional aninhado" (M3.2), além de
-        # "Condicional encadeado" (M3.1). Agora só conta como aninhado quando
-        # o `if` não é um elo de uma cadeia elif.
+        # Um `if` dentro de outro `if` (que não seja elo de uma cadeia elif)
+        # marca a raiz como estrutura aninhada. A contagem do aninhado é
+        # feita UMA VEZ POR ESTRUTURA, no fim desta função, na raiz.
         if self.in_if > 0 and not is_elif:
-            self.pattern_counts["Condicional aninhado"] += 1
-            tipos_deste_no.append("Condicional aninhado")
+            self._raiz_if.tem_aninhado = True
 
         if is_elif:
             # Já foi classificado pelo `if` raiz da cadeia; apenas segue a árvore.
             pass
         else:
-            # M2.2 - Condicional simples (sem else)
+            # M2.1 - Condicional simples (sem else)
             if len(node.orelse) == 0:
                 self.pattern_counts["Condicional simples"] += 1
                 tipos_deste_no.append("Condicional simples")
 
-            # M3.1 - Condicional encadeado (if/elif/.../else)
+            # M4.1 - Condicional encadeado (if/elif/.../else)
             elif len(node.orelse) == 1 and isinstance(node.orelse[0], ast.If):
                 self.pattern_counts["Condicional encadeado"] += 1
                 tipos_deste_no.append("Condicional encadeado")
@@ -156,26 +185,14 @@ class ASTPlanDetector(ast.NodeVisitor):
                     curr = curr.orelse[0]
                     curr.is_elif = True
 
-            # M2.1 - Condicional composto (if/else)
+            # M3.1 - Condicional composto (if/else)
             else:
                 self.pattern_counts["Condicional composto"] += 1
                 tipos_deste_no.append("Condicional composto")
 
-        # Cruzamento tipo x posição (ver _mapa_posicoes_estruturas): usa a
-        # posição REAL deste nó específico, não uma contagem global agregada.
-        #
-        # FIX: a versão anterior incrementava "com operação antes" e "com
-        # operação após" de forma INDEPENDENTE. Isso criava uma ambiguidade
-        # real: um arquivo com 1 if que tem antes E depois ao mesmo tempo
-        # gerava exatamente os mesmos números (Com_Antes=1, Com_Apos=1) que
-        # um arquivo com 2 ifs SEPARADOS -- um só com antes, outro só com
-        # depois -- tornando os dois cenários indistinguíveis no CSV.
-        #
-        # Agora cada ocorrência cai em exatamente 1 de 4 categorias
-        # mutuamente exclusivas, então a soma das 4 colunas de um tipo
-        # sempre bate com o total de ocorrências daquele tipo, e "dupla
-        # operação" (antes e depois no mesmo nó) vira uma categoria própria,
-        # distinta de "só antes" + "só depois" em nós diferentes.
+        # Cruzamento tipo x posição: cada ocorrência cai em exatamente 1 de 4
+        # categorias mutuamente exclusivas (isolado / só antes / só depois /
+        # dupla), usando a posição REAL deste nó.
         tem_antes, tem_apos = self.posicoes.get(id(node), (False, False))
         if tem_antes and tem_apos:
             categoria_posicao = "dupla operação (antes e após)"
@@ -188,51 +205,110 @@ class ASTPlanDetector(ast.NodeVisitor):
 
         for tipo in tipos_deste_no:
             # Prefixo "SUBPOS::" identifica rótulos de sub-padrão cruzado,
-            # para serem filtrados de fora de `padroes_str` em analisar_arquivo.
+            # filtrados de `padroes_str` em analisar_arquivo.
             self.pattern_counts[f"SUBPOS::{tipo}::{categoria_posicao}"] += 1
 
         self.in_if += 1
         self.generic_visit(node)
         self.in_if -= 1
 
+        # M4.2 - Condicional aninhado: medido ao redor do `if` MAIS EXTERNO
+        # da estrutura (a raiz), e contado uma vez por estrutura. Antes, a
+        # posição era a do `if` interno dentro do ramo do externo, o que não
+        # correspondia ao exemplo do documento (operações antes/depois do
+        # `if` externo).
+        if eh_raiz and getattr(node, 'tem_aninhado', False):
+            self.pattern_counts["Condicional aninhado"] += 1
+            self.pattern_counts[f"SUBPOS::Condicional aninhado::{categoria_posicao}"] += 1
+
     # ------------------------------------------------------------------ #
-    # Laços (Módulos 4, 5 e 6)
+    # Laços for (Módulos 6 e 7)
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def _range_usa_len(chamada_range):
+        """True se algum argumento do range() contém uma chamada a len()."""
+        for sub in ast.walk(chamada_range):
+            if isinstance(sub, ast.Call) and getattr(sub.func, 'id', None) == 'len':
+                return True
+        return False
+
+    @staticmethod
+    def _nomes_do_alvo(alvo):
+        return {n.id for n in ast.walk(alvo) if isinstance(n, ast.Name)}
+
+    @classmethod
+    def _variavel_indexa_colecao(cls, no_busca, alvo):
+        """
+        True se, dentro de `no_busca`, a variável do laço (`alvo`) aparece
+        dentro de um índice (`lista[i]`, `lista[i + 1]`, `m[i][j]`...).
+        """
+        nomes = cls._nomes_do_alvo(alvo)
+        if not nomes:
+            return False
+        for sub in ast.walk(no_busca):
+            if isinstance(sub, ast.Subscript):
+                for n in ast.walk(sub.slice):
+                    if isinstance(n, ast.Name) and n.id in nomes:
+                        return True
+        return False
+
+    def _classifica_for(self, node):
+        """
+        Classifica o `for` de acordo com o documento de padrões:
+
+          'indice'    -> M6 (iteração por índice): range() cujo limite vem do
+                         tamanho de uma coleção (`range(len(x))`) OU cuja
+                         variável é usada para indexar uma coleção (`x[i]`).
+          'valor'     -> M6 (iteração por valor): percorre a coleção direto.
+          'contagem'  -> M7: range() numérico, sem len() e sem indexar
+                         coleção; a variável é um contador usado na conta.
+        """
+        iterador = node.iter
+
+        if isinstance(iterador, ast.Call) and getattr(iterador.func, 'id', None) == 'range':
+            corpo = ast.Module(body=node.body, type_ignores=[])
+            if self._range_usa_len(iterador) or self._variavel_indexa_colecao(corpo, node.target):
+                return "indice"
+            return "contagem"
+
+        if isinstance(iterador, (ast.Name, ast.List, ast.Tuple, ast.Set,
+                                 ast.Dict, ast.Call, ast.Constant)):
+            return "valor"
+
+        return None
+
     def visit_For(self, node):
-        self.in_for += 1
+        tipo_for = self._classifica_for(node)
 
-        if isinstance(node.iter, ast.Call) and getattr(node.iter.func, 'id', None) == 'range':
-            # M5.1 / M5.2 / M5.3 / M6.1 / M6.2 - iteração por índice
+        if tipo_for == "indice":
             self.pattern_counts["Estrutura linear (lista/string) - iteração por índice"] += 1
-        elif isinstance(node.iter, (ast.Name, ast.List, ast.Tuple, ast.Set, ast.Dict, ast.Call, ast.Constant)):
-            # FIX: a versão anterior só reconhecia Name/List/Tuple/Str (e
-            # `ast.Str` está depreciado desde o Python 3.8 e será removido no
-            # 3.14). Um `for` sobre uma chamada como `enumerate(lista)`,
-            # `dicionario.items()`, `zip(a, b)` ou sobre uma string literal
-            # (ex.: `for c in "abc":`) não era classificado em NENHUM padrão.
-            # Agora usamos `ast.Constant` (API atual) e também cobrimos
-            # `ast.Call`, `ast.Set` e `ast.Dict`.
+        elif tipo_for == "valor":
             self.pattern_counts["Estrutura linear (lista/string) - iteração por valor"] += 1
+        # 'contagem' (M7) não gera rótulo aqui: o padrão é identificado pelo
+        # tipo de atualização do acumulador dentro do laço
+        # (ver _classifica_incremento_acumulo).
 
+        self.pilha_lacos.append({'tipo': 'for', 'tipo_for': tipo_for, 'if_base': self.in_if})
         self.generic_visit(node)
-        self.in_for -= 1
+        self.pilha_lacos.pop()
 
+    # ------------------------------------------------------------------ #
+    # Laços while (Módulo 5)
+    # ------------------------------------------------------------------ #
     @staticmethod
     def _tem_operacao_acumulo(node_laco):
         """
         Verifica se existe, em qualquer ponto do corpo do laço, uma operação
-        aritmética de acúmulo/incremento (AugAssign ou Assign autoreferente
-        com Add/Sub/Mult/Div/FloorDiv). Usado para DISTINGUIR M4.1/M4.2 (sem
-        acúmulo) de M4.3/M4.4/M4.5 (com acúmulo).
+        aritmética de acúmulo/incremento (AugAssign ou Assign autoreferente).
+        Distingue M5.1/M5.2 (sem acúmulo) de M5.3/M5.4/M5.5 (com acúmulo).
         """
-        ops_aritmeticas = (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv)
         for sub in ast.walk(node_laco):
             if sub is node_laco:
                 continue
-            if isinstance(sub, ast.AugAssign) and isinstance(sub.op, ops_aritmeticas):
+            if isinstance(sub, ast.AugAssign) and isinstance(sub.op, OPS_ARITMETICAS):
                 return True
             if isinstance(sub, ast.Assign) and isinstance(sub.value, ast.BinOp) \
-                    and isinstance(sub.value.op, ops_aritmeticas):
+                    and isinstance(sub.value.op, OPS_ARITMETICAS):
                 alvos = {t.id for t in sub.targets if isinstance(t, ast.Name)}
                 nomes_no_valor = {n.id for n in ast.walk(sub.value) if isinstance(n, ast.Name)}
                 if alvos & nomes_no_valor:
@@ -245,10 +321,9 @@ class ASTPlanDetector(ast.NodeVisitor):
 
     def _eh_validacao_entrada(self, node):
         """
-        Critério AST para M4.1 (Validação de entrada com repetição até valor
-        válido): while SEM if interno, SEM acúmulo aritmético, cuja condição
-        de parada referencia uma variável reatribuída dentro do corpo (ex.:
-        `while valor != valor_esperado: valor = input()`).
+        Critério AST para M5.1 (Validação de entrada): while SEM if interno,
+        SEM acúmulo aritmético, cuja condição de parada referencia uma
+        variável reatribuída dentro do corpo (ex.: `valor = input()`).
         """
         if self._tem_if_interno(node):
             return False
@@ -270,10 +345,9 @@ class ASTPlanDetector(ast.NodeVisitor):
 
     def _eh_menu(self, node):
         """
-        Critério AST para M4.2 (Exibição de menus): while com condição
-        literalmente True, contendo pelo menos um if interno, SEM nenhuma
-        operação de acúmulo aritmético (o que a distingue de M4.4/M4.5, que
-        também têm if dentro de while, mas COM acúmulo).
+        Critério AST para M5.2 (Exibição de menus): while com condição
+        literalmente True, com pelo menos um if interno e SEM acúmulo
+        aritmético (o que o distingue de M5.4/M5.5).
         """
         condicao_sempre_verdadeira = isinstance(node.test, ast.Constant) and node.test.value is True
         if not condicao_sempre_verdadeira:
@@ -285,33 +359,28 @@ class ASTPlanDetector(ast.NodeVisitor):
         return True
 
     def visit_While(self, node):
-        self.in_while += 1
-
-        # Os dois critérios são mutuamente excludentes por construção: M4.2
-        # exige `if` interno e M4.1 exige a ausência dele -- por isso a ordem
-        # de checagem aqui não afeta o resultado.
+        # M5.1 e M5.2 são mutuamente excludentes por construção (M5.2 exige
+        # `if` interno e M5.1 exige a ausência dele).
         if self._eh_menu(node):
             self.pattern_counts["Repetição - controle por menu"] += 1
         elif self._eh_validacao_entrada(node):
             self.pattern_counts["Repetição - validação de entrada"] += 1
 
+        self.pilha_lacos.append({'tipo': 'while', 'tipo_for': None, 'if_base': self.in_if})
         self.generic_visit(node)
-        self.in_while -= 1
+        self.pilha_lacos.pop()
 
     # ------------------------------------------------------------------ #
-    # Comprehensions (antes ignoradas pelo detector de padrões)
+    # Comprehensions
     # ------------------------------------------------------------------ #
     def _classifica_comprehension(self, node):
-        # FIX: o extrator de métricas (ASTMetricsExtractor) já contava
-        # list/dict comprehensions como laço, mas o classificador de padrões
-        # (ASTPlanDetector) nunca implementava visit_ListComp/visit_DictComp.
-        # Um código cujo único "laço" fosse uma comprehension (muito comum em
-        # soluções Python mais idiomáticas) não disparava nenhum padrão e
-        # acabava caindo, incorretamente, em "Input/output sequencial" ou em
-        # "Sem Padrão Mapeado".
+        # Mesma regra do `for`: percorrer coleção = M6; range numérico sem
+        # acúmulo não corresponde a nenhum padrão documentado.
         for generator in node.generators:
-            if isinstance(generator.iter, ast.Call) and getattr(generator.iter.func, 'id', None) == 'range':
-                self.pattern_counts["Estrutura linear (lista/string) - iteração por índice"] += 1
+            iterador = generator.iter
+            if isinstance(iterador, ast.Call) and getattr(iterador.func, 'id', None) == 'range':
+                if self._range_usa_len(iterador) or self._variavel_indexa_colecao(node, generator.target):
+                    self.pattern_counts["Estrutura linear (lista/string) - iteração por índice"] += 1
             else:
                 self.pattern_counts["Estrutura linear (lista/string) - iteração por valor"] += 1
         self.generic_visit(node)
@@ -329,69 +398,63 @@ class ASTPlanDetector(ast.NodeVisitor):
         self._classifica_comprehension(node)
 
     # ------------------------------------------------------------------ #
-    # Contadores e acumuladores (Módulos 4 e 6)
+    # Contadores e acumuladores (Módulos 5 e 7)
     # ------------------------------------------------------------------ #
-    def _classifica_incremento_acumulo(self, is_increment):
+    def _classifica_incremento_acumulo(self, is_increment, op):
         """
-        FIX (bug crítico): a versão anterior rotulava QUALQUER incremento ou
-        acúmulo dentro de um `while` como "Repetição com condição", inclusive
-        o padrão M4.3 (Acumuladores), que NÃO possui `if` interno -- apenas a
-        própria condição do `while`. Isso misturava, sob o mesmo rótulo, o
-        padrão M4.3 (incondicional) com os padrões M4.5/M4.6 (condicionados
-        por um `if` interno ao laço). Agora o rótulo "com condição" só é
-        usado quando o incremento/acúmulo realmente está dentro de um `if`
-        (in_if > 0); caso contrário, usa-se o rótulo genérico M4.3/M6.
-        """
-        se_condicionado = self.in_if > 0
+        Rotula o incremento/acúmulo de acordo com o laço MAIS INTERNO:
 
-        if self.in_for > 0:
-            if se_condicionado:
-                key = "Repetição com condição - incremento de variável" if is_increment \
+          while, sem `if` interno ao laço  -> M5.3 (Repetição - ...)
+          while, dentro de `if` do laço    -> M5.4/M5.5 (Repetição com condição - ...)
+          for de contagem numérica         -> M7 (Repetição por contagem - ...)
+          for sobre coleção (M6)           -> sem rótulo próprio: a operação já
+                                              faz parte do padrão Estrutura linear.
+
+        Para M7 também é registrada a família da operação (aditiva ou
+        multiplicativa), que separa M7.1 (Somatórios) de M7.2 (Séries).
+        """
+        if not self.pilha_lacos:
+            return
+
+        laco = self.pilha_lacos[-1]
+        # Só conta como "condicionado" um `if` aberto DEPOIS do laço; um `if`
+        # que apenas envolve o laço não torna o acúmulo condicional.
+        condicionado = self.in_if > laco['if_base']
+
+        if laco['tipo'] == 'while':
+            if condicionado:
+                chave = "Repetição com condição - incremento de variável" if is_increment \
                     else "Repetição com condição - acúmulo de variável"
             else:
-                key = "Repetição - incremento de variável" if is_increment \
+                chave = "Repetição - incremento de variável" if is_increment \
                     else "Repetição - acúmulo de variável"
-            self.pattern_counts[key] += 1
+            self.pattern_counts[chave] += 1
 
-        if self.in_while > 0:
-            if se_condicionado:
-                # M4.5 / M4.6
-                key = "Repetição com condição - incremento de variável" if is_increment \
-                    else "Repetição com condição - acúmulo de variável"
-            else:
-                # M4.3
-                key = "Repetição - incremento de variável" if is_increment \
-                    else "Repetição - acúmulo de variável"
-            self.pattern_counts[key] += 1
+        elif laco['tipo_for'] == 'contagem':
+            chave = "Repetição por contagem - incremento de variável" if is_increment \
+                else "Repetição por contagem - acúmulo de variável"
+            self.pattern_counts[chave] += 1
+
+            familia = "multiplicativo" if isinstance(op, OPS_MULTIPLICATIVAS) else "aditivo"
+            self.pattern_counts[f"SUBCONT::{familia}"] += 1
 
     @staticmethod
     def _eh_passo_unitario(op, valor_constante):
-        # FIX: a versão anterior classificava como "incremento" qualquer
-        # atribuição cujo operando constante fosse 1, SEM checar o operador.
-        # Isso incluía até casos sem sentido, como `x *= 1` ou `x /= 1`.
-        # Agora só é "incremento" quando o passo é +1 ou -1 (contador simples),
-        # e qualquer outro operador (*, /, //) ou passo diferente de 1 é
-        # tratado como "acúmulo".
+        # Só é "incremento" quando o passo é +1 ou -1 (contador simples);
+        # qualquer outro operador ou passo é tratado como "acúmulo".
         return isinstance(op, (ast.Add, ast.Sub)) and valor_constante == 1
 
     def visit_AugAssign(self, node):
-        if isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv)):
-            # FIX (bug crítico): a versão anterior só considerava Add/Sub, o
-            # que fazia o padrão M6.2 (Séries numéricas, ex.: fatorial com
-            # `fatorial *= i`) nunca ser detectado quando escrito com `*=`.
+        if isinstance(node.op, OPS_ARITMETICAS):
             is_increment = (
                 isinstance(node.value, ast.Constant)
                 and self._eh_passo_unitario(node.op, node.value.value)
             )
-            self._classifica_incremento_acumulo(is_increment)
+            self._classifica_incremento_acumulo(is_increment, node.op)
         self.generic_visit(node)
 
     def visit_Assign(self, node):
-        if isinstance(node.value, ast.BinOp) and isinstance(
-            node.value.op, (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv)
-        ):
-            # FIX: adicionados Mult/Div/FloorDiv para cobrir
-            # `fatorial = fatorial * i` (M6.2), que antes era ignorado.
+        if isinstance(node.value, ast.BinOp) and isinstance(node.value.op, OPS_ARITMETICAS):
             targets = [getattr(t, 'id', None) for t in node.targets if isinstance(t, ast.Name)]
             left = getattr(node.value.left, 'id', None) if isinstance(node.value.left, ast.Name) else None
             right = getattr(node.value.right, 'id', None) if isinstance(node.value.right, ast.Name) else None
@@ -404,9 +467,9 @@ class ASTPlanDetector(ast.NodeVisitor):
                     elif isinstance(node.value.left, ast.Constant):
                         is_increment = self._eh_passo_unitario(node.value.op, node.value.left.value)
 
-                    self._classifica_incremento_acumulo(is_increment)
-                    # FIX: `break` evitava contagem duplicada quando há mais
-                    # de um alvo na mesma atribuição (ex.: `x = y = x + 1`).
+                    self._classifica_incremento_acumulo(is_increment, node.value.op)
+                    # `break` evita contagem duplicada quando há mais de um
+                    # alvo na mesma atribuição (ex.: `x = y = x + 1`).
                     break
 
         self.generic_visit(node)
@@ -417,12 +480,6 @@ def _mapa_posicoes_estruturas(tree):
     Pré-calcula, para CADA nó If/For/While do arquivo, se existe alguma
     instrução antes e/ou depois dele na lista de instruções (body/orelse/
     finalbody) que o contém -- indexado por id(node).
-
-    É o que permite ao ASTPlanDetector cruzar a posição com o tipo
-    estrutural do MESMO nó (ex.: "este if específico, já classificado como
-    Condicional composto, tem operação antes?"), em vez de um agregado
-    global desconectado do tipo (que é o que detectar_subpadroes_posicionais
-    continua fazendo, propositalmente, para os sub-padrões de laço).
     """
     posicoes = {}
     for node in ast.walk(tree):
@@ -432,9 +489,6 @@ def _mapa_posicoes_estruturas(tree):
                 continue
             for idx, stmt in enumerate(lista_stmts):
                 if isinstance(stmt, (ast.If, ast.For, ast.While)):
-                    # cada stmt pertence a exatamente uma lista de
-                    # instruções (seu único pai sintático), então id(stmt)
-                    # nunca é sobrescrito por engano aqui.
                     posicoes[id(stmt)] = _bloco_tem_vizinhos(lista_stmts, idx)
     return posicoes
 
@@ -449,14 +503,14 @@ def _bloco_tem_vizinhos(lista_stmts, idx):
 
 def _variavel_inicializada_e_atualizada(stmt_antes, no_laco):
     """
-    Sub-padrão 5: verifica se `stmt_antes` é uma atribuição simples
-    (`var = <algo>`) e se essa mesma variável é reatribuída em algum ponto
-    dentro do corpo do laço (`no_laco`), via Assign ou AugAssign.
+    Verifica se `stmt_antes` é uma atribuição simples (`var = <algo>`) e se
+    essa mesma variável é reatribuída em algum ponto dentro do corpo do laço
+    (via Assign ou AugAssign).
 
-    Generaliza o conceito de "acumulador" (M4.3-M4.5, M5.2, M6.1, M6.2) para
-    qualquer variável de estado/controle inicializada antes do laço e
-    modificada dentro dele -- cobre também M5.1 (maior = lista[i], que não é
-    autoreferente), M4.2 (opcao = input(), estado do menu) e M4.1 (valor
+    Generaliza o conceito de "acumulador" (M5.3-M5.5, M6.1, M6.2, M7.1, M7.2)
+    para qualquer variável de estado/controle inicializada antes do laço e
+    modificada dentro dele -- cobre também M6.1 (maior = lista[i], que não é
+    autoreferente), M5.2 (opcao = input(), estado do menu) e M5.1 (valor
     relido a cada iteração).
     """
     if not isinstance(stmt_antes, ast.Assign):
@@ -480,21 +534,13 @@ def _variavel_inicializada_e_atualizada(stmt_antes, no_laco):
 
 def detectar_subpadroes_posicionais(tree):
     """
-    Detecta os sub-padrões estruturais de POSIÇÃO (antes/dentro/após) que o
-    documento de padrões já anotava nos comentários do esqueleto de código
-    (ex.: "# operações antes do condicional", "# operações antes do laço"),
-    mas que nunca eram extraídos como feature pelo pipeline original.
-
-    Diferente de ASTPlanDetector (que escolhe 1 padrão dominante por
-    arquivo), aqui os sub-padrões NÃO são mutuamente exclusivos -- um mesmo
-    `if` ou laço pode contribuir para múltiplas contagens ao mesmo tempo,
-    por isso o resultado fica fora da lógica de hierarquia/dominância.
+    Detecta os sub-padrões estruturais de POSIÇÃO (antes/depois) em torno de
+    condicionais e laços. Diferente de ASTPlanDetector (que escolhe 1 padrão
+    dominante por arquivo), aqui os sub-padrões NÃO são mutuamente exclusivos,
+    por isso ficam fora da lógica de hierarquia/dominância.
     """
     contagem = Counter()
 
-    # Percorre toda lista de instruções do código (body/orelse/finalbody de
-    # qualquer nó), para também capturar estruturas de controle aninhadas,
-    # não só as de "topo" do arquivo/função.
     for node in ast.walk(tree):
         for attr in ("body", "orelse", "finalbody"):
             lista_stmts = getattr(node, attr, None)
@@ -541,10 +587,7 @@ def analisar_arquivo(caminho_arquivo):
 
         subpadroes = detectar_subpadroes_posicionais(tree)
 
-        # LLOC (linhas lógicas de código) via radon -- mais robusto que a
-        # contagem de linhas física (LOC) feita acima, pois normaliza
-        # statements que ocupam várias linhas físicas (parênteses, barras de
-        # continuação) e statements múltiplos na mesma linha física (`;`).
+        # LLOC (linhas lógicas de código) via radon.
         try:
             lloc = radon_analyze(codigo).lloc
             if not lloc:
@@ -568,8 +611,6 @@ def analisar_arquivo(caminho_arquivo):
         features['Norm_Ifs_Por_LOC'] = round(features['AST_Qtd_Ifs'] / loc, 4)
         features['Norm_Loops_Por_LOC'] = round(features['AST_Qtd_Loops'] / loc, 4)
 
-        # Normalizações equivalentes usando LLOC (quando disponível), mais
-        # fiéis para comparar exercícios com estilos de formatação distintos.
         if lloc:
             features['Norm_Complexidade_Por_LLOC'] = round(features['AST_Complexidade_Ciclomatica'] / lloc, 4)
             features['Norm_Ifs_Por_LLOC'] = round(features['AST_Qtd_Ifs'] / lloc, 4)
@@ -579,9 +620,8 @@ def analisar_arquivo(caminho_arquivo):
             features['Norm_Ifs_Por_LLOC'] = None
             features['Norm_Loops_Por_LLOC'] = None
 
-        # Sub-padrões posicionais (ver relatório): não entram na hierarquia
-        # de dominância, pois não são mutuamente exclusivos entre si nem com
-        # o padrão dominante escolhido abaixo.
+        # Sub-padrões posicionais globais (não exclusivos entre si nem com o
+        # padrão dominante).
         subpadroes_mapeados = {
             "If - operação antes do condicional": "Sub_If_Operacao_Antes",
             "If - operação após o condicional": "Sub_If_Operacao_Apos",
@@ -592,16 +632,10 @@ def analisar_arquivo(caminho_arquivo):
         for chave, coluna in subpadroes_mapeados.items():
             features[coluna] = subpadroes.get(chave, 0)
 
-        # Sub-padrões CRUZADOS (tipo específico x posição), calculados dentro
-        # de ASTPlanDetector.visit_If usando a posição real de CADA nó. Ao
-        # contrário dos Sub_If_Operacao_* acima (agregados globais, sem saber
-        # qual tipo de if era), estes sabem exatamente a qual tipo pertencem
-        # -- e, dentro de cada tipo, usam 4 categorias MUTUAMENTE EXCLUSIVAS
-        # (isolado / só antes / só depois / dupla) em vez de 2 contadores
-        # independentes, evitando a ambiguidade entre "1 if com antes+depois"
-        # e "2 ifs separados, um só-antes + um só-depois" (ver conversa).
-        # A soma das 4 colunas de um tipo sempre bate com o total de
-        # ocorrências daquele tipo em padroes_str.
+        # Sub-padrões CRUZADOS (tipo de condicional x posição): 4 categorias
+        # mutuamente exclusivas por tipo. A soma das 4 colunas de um tipo é o
+        # total de ocorrências daquele tipo (para Aninhado: uma ocorrência por
+        # estrutura aninhada, medida ao redor do `if` mais externo).
         _tipos_condicional = ["Condicional simples", "Condicional composto",
                                "Condicional encadeado", "Condicional aninhado"]
         _nome_coluna_tipo = {
@@ -610,9 +644,6 @@ def analisar_arquivo(caminho_arquivo):
             "Condicional encadeado": "Encadeado",
             "Condicional aninhado": "Aninhado",
         }
-        # FIX (nomenclatura): alinhado com os nomes de coluna do documento de
-        # padrões (Sub_<Tipo>_Antes / Sub_<Tipo>_Depois), que usa nomes mais
-        # curtos que a versão anterior do código (que tinha "So_Antes"/"So_Apos").
         _categorias_posicao = {
             "isolado (sem antes/depois)": "Isolado",
             "só operação antes": "Antes",
@@ -625,36 +656,41 @@ def analisar_arquivo(caminho_arquivo):
                 _coluna = f"Sub_{_nome_coluna_tipo[_tipo]}_{_cat_sufixo}"
                 features[_coluna] = detector.pattern_counts.get(_chave, 0)
 
+        # Sub-padrões do Módulo 7: família da operação do acumulador em
+        # laços de contagem numérica (M7.1 aditivo x M7.2 multiplicativo).
+        features['Sub_Contagem_Aditivo'] = detector.pattern_counts.get("SUBCONT::aditivo", 0)
+        features['Sub_Contagem_Multiplicativo'] = detector.pattern_counts.get("SUBCONT::multiplicativo", 0)
+
         # M1 - Input/output sequencial
         if features['AST_Qtd_Loops'] == 0 and features['AST_Qtd_Ifs'] == 0:
             detector.pattern_counts["Input/output sequencial"] += 1
 
-        # LÓGICA DE HIERARQUIA GLOBAL (mantém apenas o padrão mais complexo)
-        # Ordem do mais difícil (listas) para o mais fácil (sequencial).
-        # NOTA (ver relatório): por design, "Estrutura linear" domina qualquer
-        # `for` sobre range()/lista, o que faz os padrões M6.1 (Somatórios) e
-        # M6.2 (Séries numéricas) raramente aparecerem como padrão dominante
-        # quando implementados com `for` -- eles ficam "escondidos" atrás de
-        # "Estrutura linear - iteração por índice", já que M5.2 (Soma de
-        # Vetor) e M6.1 (Somatórios) são, no documento de padrões, literalmente
-        # o mesmo trecho de código. Isso é uma inconsistência do documento de
-        # padrões, e não um bug deste script (ver relatório em anexo).
+        # HIERARQUIA GLOBAL (mantém apenas o padrão mais complexo), do mais
+        # complexo ao mais simples. Critérios, em ordem de peso: estruturas
+        # combinadas (decisão < laço < laço com decisão < coleção); repetições
+        # conhecidas (for de contagem) < desconhecidas (while); incremento <
+        # acúmulo; iteração por valor < por índice.
         ordem_complexidade = [
+            # Nível 5 - Coleção (M6): o laço percorre uma estrutura de dados
             "Estrutura linear (lista/string) - iteração por índice",
             "Estrutura linear (lista/string) - iteração por valor",
+            # Nível 4 - Laço com decisão (M5): while + if (+ coleção indexada)
             "Repetição com condição - acúmulo de variável",
             "Repetição com condição - incremento de variável",
+            "Repetição - controle por menu",
+            # Nível 3 - Repetição básica: repetições desconhecidas (while) e
+            # repetições conhecidas (for de contagem, M7)
             "Repetição - acúmulo de variável",
             "Repetição - incremento de variável",
-            # M4.2 e M4.1: laços sem acúmulo aritmético. Ficam abaixo dos
-            # tiers numéricos (M4.3-M4.5), mas acima de qualquer condicional
-            # isolado, pois já combinam laço (+ if/elif, no caso do menu).
-            "Repetição - controle por menu",
             "Repetição - validação de entrada",
+            "Repetição por contagem - acúmulo de variável",
+            "Repetição por contagem - incremento de variável",
+            # Nível 2 - Decisão (M2 a M4)
             "Condicional aninhado",
             "Condicional encadeado",
             "Condicional composto",
             "Condicional simples",
+            # Nível 1 - Sequencial (M1)
             "Input/output sequencial"
         ]
 
@@ -669,33 +705,37 @@ def analisar_arquivo(caminho_arquivo):
                 if p != padrao_dominante:
                     detector.pattern_counts[p] = 0
 
+        features['Modulo_Dominante'] = MODULO_POR_PADRAO.get(padrao_dominante, "Sem módulo")
+
+        # Os rótulos "Repetição - ..." (while, M5.3) e "Repetição por
+        # contagem - ..." (for, M7) são categorias distintas e ambos têm
+        # coluna própria.
         padroes_mapeados = [
             "Input/output sequencial",
             "Condicional simples",
             "Condicional composto",
             "Condicional encadeado",
             "Condicional aninhado",
-            "Repetição por contagem - incremento de variável",
-            "Repetição por contagem - acúmulo de variável",
+            "Repetição - incremento de variável",
+            "Repetição - acúmulo de variável",
             "Repetição com condição - incremento de variável",
             "Repetição com condição - acúmulo de variável",
             "Repetição - controle por menu",
             "Repetição - validação de entrada",
             "Estrutura linear (lista/string) - iteração por índice",
-            "Estrutura linear (lista/string) - iteração por valor"
+            "Estrutura linear (lista/string) - iteração por valor",
+            "Repetição por contagem - incremento de variável",
+            "Repetição por contagem - acúmulo de variável",
         ]
 
         for p in padroes_mapeados:
             features[f'Freq_{p.replace(" ", "_").replace("/", "_")}'] = detector.pattern_counts.get(p, 0)
 
-        # FIX: exclui os rótulos cruzados (prefixo "SUBPOS::") do padroes_str
-        # -- eles vivem em detector.pattern_counts para alimentar as colunas
-        # Sub_*_Isolado/So_Antes/So_Apos/Dupla acima, mas não são padrões
-        # dominantes por si só (são anotações sobre um padrão já listado),
-        # então não devem aparecer duplicados dentro de padroes_str.
+        # Rótulos auxiliares (SUBPOS::, SUBCONT::) alimentam colunas Sub_*,
+        # mas não são padrões dominantes e ficam fora de padroes_str.
         encontrados = [
             p for p, count in detector.pattern_counts.items()
-            if count > 0 and not p.startswith("SUBPOS::")
+            if count > 0 and not p.startswith(("SUBPOS::", "SUBCONT::"))
         ]
         features['padroes_str'] = "; ".join(encontrados) if encontrados else "Sem Padrão Mapeado"
 
@@ -704,14 +744,14 @@ def analisar_arquivo(caminho_arquivo):
         return None
 
 
-def processar_exercicios_v15(path_exercises):
+def processar_exercicios_v16(path_exercises):
     base_path = Path(path_exercises)
     resultados = []
 
     pastas_exercicios = [p for p in base_path.iterdir() if p.is_dir()]
     print(f"Encontradas {len(pastas_exercicios)} pastas em {base_path}")
 
-    for pasta in tqdm(pastas_exercicios, desc="Extraindo Taxonomia Estrutural (V15)"):
+    for pasta in tqdm(pastas_exercicios, desc="Extraindo Taxonomia Estrutural (V16)"):
         arquivos_py = list(pasta.glob("*.py"))
         arquivo_alvo = None
 
@@ -733,20 +773,22 @@ def processar_exercicios_v15(path_exercises):
             resultados.append(features)
 
     df = pd.DataFrame(resultados)
-    cols = ['id_exercicio', 'padroes_str'] + [c for c in df.columns if c not in ['id_exercicio', 'padroes_str']]
+    cols = ['id_exercicio', 'padroes_str', 'Modulo_Dominante'] + [
+        c for c in df.columns if c not in ['id_exercicio', 'padroes_str', 'Modulo_Dominante']
+    ]
     return df[cols]
 
 
 # EXECUÇÃO DO PIPELINE
 caminho_do_script = Path(__file__).parent
-#pasta_testes = caminho_do_script.parent
 arquivos_gerais_pibic = caminho_do_script.parent
 
 caminho_exercises = arquivos_gerais_pibic / "DataSet" / "exerciciosSolucao"
 
-df_features_final = processar_exercicios_v15(caminho_exercises)
+df_features_final = processar_exercicios_v16(caminho_exercises)
 
 if not df_features_final.empty:
-    output_file = caminho_do_script /"resultado_analise_padroes" / "features_ast_padroes_completos.csv"
+    output_file = caminho_do_script / "resultado_analise_padroes" / "features_ast_padroes_completos.csv"
+    output_file.parent.mkdir(parents=True, exist_ok=True)
     df_features_final.to_csv(output_file, index=False)
-    print(f"\nSucesso! Arquivo V15 salvo em: {output_file}")
+    print(f"\nSucesso! Arquivo V16 salvo em: {output_file}")
