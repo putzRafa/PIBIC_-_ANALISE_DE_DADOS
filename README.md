@@ -18,18 +18,13 @@ ARQUIVOS_GERAIS_PIBIC/
 │   └── resultado_analise_padroes/
 │       ├── features_ast_padroes_completos.csv  # saída do extrator (uma linha por exercício)
 │       ├── M1_resultados.csv                   # saída das métricas (ver abaixo)
-│       ├── M2_resultados.csv
-│       └── M3_resultados.csv
+│       ├── ...
 ├── CLASSIFICACAO_METRICAS/
 │   ├── transactions/                           # (conteúdo não detalhado)
 │   ├── M1_taxaAcerto.py
-│   ├── M2_submissao.py
-│   └── M3_TaxaAceitacao.py
+│   ├── ...
 ├── DataSet/
 │   └── exerciciosSolucao/                      # soluções dos exercícios (uma subpasta por exercício)
-├── .gitignore
-├── ARQUIVOS_GERAIS_PIBIC.code-workspace
-└── README.md
 ```
 
 **Extrator de padrões (`ANALISE_DE_CODIGOS`).** Lê as soluções em `DataSet/exerciciosSolucao`, classifica cada uma e grava `features_ast_padroes_completos.csv`. O restante deste README descreve esse extrator.
